@@ -6,3 +6,12 @@ Version4.0/workspace/*
 Version4.0/conf/*.crt
 Version4.0/conf/*.key
 *.swp
+
+# IDE and local build artifacts
+.vs/
+.vscode/
+cmake-build-*/
+build/
+*.user
+*.suo
+*.pdb
