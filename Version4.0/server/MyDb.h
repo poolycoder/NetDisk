@@ -1,175 +1,68 @@
 #pragma once
-#include <string>
-#include <mysql/mysql.h>
-#include <iostream>
-using namespace std;
 
-class MyDb
-{
+#include <cstdint>
+#include <string>
+#include <vector>
+
+#include <mysql/mysql.h>
+
+struct FileEntry {
+    std::uint64_t id = 0;
+    std::uint64_t parentId = 0;
+    std::string name;
+    char type = 'f';
+    std::uint64_t size = 0;
+    std::string sha256;
+};
+
+class MyDb {
 public:
     MyDb();
     ~MyDb();
-    bool initDB(string host, string user, string pwd, string db_name, int port);
-    bool exeSQL(string sql);
-    bool select_one_SQL(std::string sql, string &str);
-    bool select_many_SQL(std::string sql, string &str);
+
+    MyDb(const MyDb &) = delete;
+    MyDb &operator=(const MyDb &) = delete;
+
+    bool initDB(const std::string &host, const std::string &user,
+                const std::string &password, const std::string &database,
+                unsigned int port, std::string &error);
+
+    bool userExists(const std::string &user, bool &exists, std::string &error);
+    bool createUser(const std::string &user, const std::string &passwordHash,
+                    std::string &error);
+    bool getPasswordHash(const std::string &user, std::string &hash,
+                         std::string &error);
+
+    bool listEntries(const std::string &user, std::uint64_t parentId,
+                     std::vector<FileEntry> &entries, std::string &error);
+    bool findEntry(const std::string &user, std::uint64_t parentId,
+                   const std::string &name, FileEntry &entry, std::string &error);
+    bool getParentId(const std::string &user, std::uint64_t directoryId,
+                     std::uint64_t &parentId, std::string &error);
+    bool createDirectory(const std::string &user, std::uint64_t parentId,
+                         const std::string &name, std::string &error);
+    bool deleteDirectory(const std::string &user, std::uint64_t parentId,
+                         const std::string &name, std::string &error);
+    bool deleteFile(const std::string &user, std::uint64_t parentId,
+                    const std::string &name, FileEntry &deletedEntry,
+                    std::string &error);
+
+    bool hasSha256(const std::string &sha256, bool &exists, std::string &error);
+    bool hasOtherSha256Reference(const std::string &sha256,
+                                 const std::string &user,
+                                 std::uint64_t parentId,
+                                 const std::string &name,
+                                 bool &exists, std::string &error);
+    bool insertFile(const std::string &user, std::uint64_t parentId,
+                    const std::string &name, std::uint64_t size,
+                    const std::string &sha256, std::string &error);
+    bool writeLog(const std::string &user, const std::string &operation,
+                  std::string &error);
+
 private:
-    MYSQL *mysql;
-    MYSQL_RES *result;
-    MYSQL_ROW row;
+    MYSQL *mysql_;
+    bool mysqlThreadInitialized_;
+
+    bool executeStatement(const char *sql, MYSQL_BIND *parameters,
+                          unsigned long parameterCount, std::string &error);
 };
-
-MyDb::MyDb()
-{
-    mysql = mysql_init(NULL);
-
-    if (!mysql)
-    {
-        cout << "Error:" << mysql_error(mysql);
-        exit(1);
-    }
-}
-
-MyDb::~MyDb()
-{
-    if (mysql)
-    {
-        mysql_close(mysql);
-    }
-}
-
-bool MyDb::initDB(std::string host, std::string user, std::string passwd, std::string db_name, int port = 3306)
-{
-    mysql = mysql_real_connect(mysql, host.c_str(), user.c_str(), passwd.c_str(), db_name.c_str(), port, NULL, 0);
-    if (!mysql)
-    {
-        cout << "Error: " << mysql_error(mysql);
-        return false;
-    }
-
-    return true;
-}
-
-bool MyDb::exeSQL(std::string sql)
-{
-    //mysql_query()执行成功返回0,执行失败返回非0值。
-    if (mysql_query(mysql, sql.c_str()))
-    {
-        cout << "Query Error: " << mysql_error(mysql);
-        return false;
-    }
-
-    result = mysql_store_result(mysql);
-
-    if (result)
-    {
-        //获取结果集中总共的字段数，即列数
-        int num_fields = mysql_num_fields(result);
-        unsigned long long num_rows = mysql_num_rows(result);
-        for (unsigned long long i = 0; i < num_rows; i++)
-        {
-            row = mysql_fetch_row(result);
-            if (!row)
-            {
-                break;
-            }
-
-            for (int j = 0; j < num_fields; j++)
-            {
-                cout << row[j] << "\t\t";
-            }
-            cout << endl;
-        }
-    }
-    else
-    {
-        //代表执行的是update,insert,delete类的非查询语句
-        if (mysql_field_count(mysql) == 0)
-        {
-            // 返回update,insert,delete影响的行数
-            unsigned long long num_rows = mysql_affected_rows(mysql);
-
-            return num_rows;
-        }
-        else
-        {
-            cout << "Get result error: " << mysql_error(mysql);
-            return false;
-        }
-    }
-
-    return true;
-}
-
-//只查找一个字段一行，并存入str中, 如果查找的不存在，那么str仍将会为空值
-bool MyDb::select_one_SQL(std::string sql, string &str)
-{
-    //mysql_query()执行成功返回0,执行失败返回非0值。
-    if (mysql_query(mysql, sql.c_str()))
-    {
-        cout << "Query Error: " << mysql_error(mysql);
-        return false;
-    }
-
-    result = mysql_store_result(mysql);
-
-    if (result)
-    {
-        //获取结果集中总共的字段数，即列数
-        int num_fields = mysql_num_fields(result);
-        unsigned long long num_rows = mysql_num_rows(result);
-
-        for (unsigned long long i = 0; i < num_rows; i++)
-        {
-            row = mysql_fetch_row(result);
-            if (!row)
-            {
-                break;
-            }
-
-            for (int j = 0; j < num_fields; j++)
-            {
-                str = row[j];
-            }
-        }
-    }
-    return true;
-}
-
-
-//查找多个字段多个行，并存入str中
-bool MyDb::select_many_SQL(std::string sql, string &str)
-{
-    //mysql_query()执行成功返回0,执行失败返回非0值。
-    if (mysql_query(mysql, sql.c_str()))
-    {
-        cout << "Query Error: " << mysql_error(mysql);
-        return false;
-    }
-
-    result = mysql_store_result(mysql);
-
-    if (result)
-    {
-        //获取结果集中总共的字段数，即列数
-        int num_fields = mysql_num_fields(result);
-        unsigned long long num_rows = mysql_num_rows(result);
-
-        for (unsigned long long i = 0; i < num_rows; i++)
-        {
-            row = mysql_fetch_row(result);
-            if (!row)
-            {
-                break;
-            }
-
-            for (int j = 0; j < num_fields; j++)
-            {
-                str += row[j];
-                str += "|\t\t";
-            }
-            str += "\n";
-        }
-    }
-    return true;
-}

@@ -1,0 +1,11 @@
+.git
+.gitignore
+.vscode
+**/*.o
+**/server
+**/client
+**/protocol_crypto_test
+Version4.0/workspace
+Version4.0/conf/server.crt
+Version4.0/conf/server.key
+docker-compose.override.yml

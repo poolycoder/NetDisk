@@ -1,0 +1,8 @@
+Version4.0/client/client
+Version4.0/server/server
+Version4.0/client/*.o
+Version4.0/server/*.o
+Version4.0/workspace/*
+Version4.0/conf/*.crt
+Version4.0/conf/*.key
+*.swp

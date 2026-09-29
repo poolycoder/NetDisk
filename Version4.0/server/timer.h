@@ -1,39 +1,35 @@
-#include "function.h"
-#include <unordered_map>
+#pragma once
 
-class Timer
-{
+#include <chrono>
+#include <condition_variable>
+#include <functional>
+#include <map>
+#include <mutex>
+#include <thread>
+
+class Timer {
 public:
-    Timer()
-    {
-        //从创建就开始进行轮询
-        pthread_t pth;
-        pthread_create(&pth, NULL, ask, &timeMap);
-        sleep(1);
-    }
+    using TimeoutHandler = std::function<void(int)>;
 
-    //有新的客户端连接上
-    void add(const int &fd)
-    {
-        time_t t;
-        time(&t);
-        timeMap[fd] = t;
-    }
+    Timer(int timeoutSeconds, TimeoutHandler handler);
+    ~Timer();
 
-    //客户端关闭
-    void deleteFd(const int &fd)
-    {
-        timeMap.erase(fd);
-    }
+    Timer(const Timer &) = delete;
+    Timer &operator=(const Timer &) = delete;
 
-    //客户端发来数据
-    void update(const int &fd)
-    {
-        time_t t;
-        time(&t);
-        timeMap[fd] = t;
-    }
+    void add(int fd);
+    void update(int fd);
+    void remove(int fd);
+    void stop();
 
 private:
-    unordered_map<int, time_t> timeMap; //<用户名fd,上一次发送包的时间>
+    void run();
+
+    int timeoutSeconds_;
+    TimeoutHandler handler_;
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    std::map<int, std::chrono::steady_clock::time_point> clients_;
+    std::thread thread_;
+    bool stopped_ = false;
 };

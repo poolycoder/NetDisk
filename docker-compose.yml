@@ -1,0 +1,38 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: netdisk-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: root_dev_password
+      MYSQL_DATABASE: Netdisk
+      MYSQL_USER: netdisk
+      MYSQL_PASSWORD: netdisk_dev_password
+    volumes:
+      - netdisk_mysql_data:/var/lib/mysql
+      - ./Version4.0/conf/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  netdisk-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: netdisk-server
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    ports:
+      - "2000:2000"
+    volumes:
+      - netdisk_file_data:/opt/netdisk/Version4.0/workspace
+      - netdisk_tls_data:/opt/netdisk/tls
+
+volumes:
+  netdisk_mysql_data:
+  netdisk_file_data:
+  netdisk_tls_data:

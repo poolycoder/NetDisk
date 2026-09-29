@@ -1,273 +1,220 @@
 #include "function.h"
 
-/***************************puts*********************************/
-void *upLoad(void *arg)
+#include "../common/crypto.h"
+#include "../common/protocol.h"
+
+#include <fcntl.h>
+#include <fstream>
+#include <cerrno>
+#include <iostream>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <vector>
+
+namespace {
+
+std::string baseName(const std::string &path)
 {
-    bool flag;
-    LoadTask *task = (LoadTask *)arg;
-    string username = task->username;
-    int Dir = task->Dir;
-    //子线程重新连接开启新的描述符
-    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (-1 == sockfd)
-    {
-        perror("sockfd");
-        pthread_exit(NULL);
-    }
-    struct sockaddr_in sockinfo;
-    bzero(&sockinfo, sizeof(sockinfo));
-    sockinfo.sin_addr.s_addr = inet_addr(IP);
-    sockinfo.sin_port = htons(PORT);
-    sockinfo.sin_family = AF_INET;
-    int ret = connect(sockfd, (sockaddr *)&sockinfo, sizeof(sockinfo));
-    if (-1 == ret)
-    {
-        perror("connect");
-        pthread_exit(NULL);
-    }
-
-    //将指令传送到服务器
-    Packet packet;
-    string orders = task->orders;
-    packet.dataLen = strlen(orders.c_str());
-    memcpy(packet.buf, orders.c_str(), packet.dataLen);
-    sendCycle(sockfd, &packet, 4 + packet.dataLen);
-    //解析命令
-    stringstream ss(orders);
-    string order, name, order2; //order代表命令，name代表跟在name后面的文件名，order2代表补充命令（可为空）
-    ss >> order >> name >> order2;
-    const char *FILENAME = name.c_str();
-
-
-    //发送用户姓名
-    packet.dataLen = strlen(username.c_str());
-    memcpy(packet.buf, username.c_str(), packet.dataLen);
-    sendCycle(sockfd, &packet, 4 + packet.dataLen);
-    //发送目录号
-    sendCycle(sockfd, &Dir, 4);
-    //发送MD5码
-    string md5;
-    ret = get_file_md5(name, md5);
-    if (ret == -1)
-    {
-        perror("md5");
-        pthread_exit(NULL);
-    }
-    packet.dataLen = strlen(md5.c_str());
-    memcpy(packet.buf, md5.c_str(), packet.dataLen);
-    sendCycle(sockfd, &packet, 4 + packet.dataLen);
-    //1.判断文件是否重复
-    recvCycle(sockfd, &flag, 1);
-    if (!flag)
-    {
-        cout << "上传失败，文件名称相同！" << endl;
-        pthread_exit(NULL);
-    }
-    //2.判断传送文件还是直接秒传
-    recvCycle(sockfd, &flag, 1);
-    if (flag)
-    {
-        cout << "100%! 秒传成功!" << endl;
-    }
-    else
-    {
-        cout << endl;
-        sendFile(sockfd, FILENAME);
-    }
-    close(sockfd);
-    pthread_exit(NULL);
+    const std::size_t slash = path.find_last_of("/\\");
+    return slash == std::string::npos ? path : path.substr(slash + 1);
 }
 
-int sendFile(int sockfd, const char *FILENAME)
+bool writeAll(int fd, const unsigned char *data, std::size_t length)
 {
-    int ret;
-    Packet packet;
-    int file_fd = open(FILENAME, O_RDWR);
-    ERROR_CHECK(file_fd, -1, "open");
-    //传送文件大小
-    struct stat statbuf;
-    ret = stat(FILENAME, &statbuf);
-    if (-1 == ret)
-    {
-        perror("stat");
-        pthread_exit(NULL);
+    std::size_t written = 0;
+    while (written < length) {
+        const ssize_t result = write(fd, data + written, length - written);
+        if (result < 0 && errno == EINTR) {
+            continue;
+        }
+        if (result <= 0) {
+            return false;
+        }
+        written += static_cast<std::size_t>(result);
     }
-    off_t filesize = statbuf.st_size;
-    packet.dataLen = sizeof(off_t);
-    memcpy(packet.buf, &filesize, packet.dataLen);
-    sendCycle(sockfd, &packet, sizeof(int) + packet.dataLen);
-    //传送文件内容
-    char *pmap = (char *)mmap(NULL, filesize, PROT_READ, MAP_SHARED, file_fd, 0);
-    ERROR_CHECK(pmap, (char *)-1, "mmap");
-    off_t offset = 0, lastsize = 0;
-    off_t slice = filesize / 100;
-    while (1)
-    {
-        if (filesize > offset + (off_t)sizeof(packet.buf))
-        {
-            packet.dataLen = sizeof(packet.buf);
-            memcpy(packet.buf, pmap + offset, packet.dataLen);
-            sendCycle(sockfd, &packet, sizeof(int) + packet.dataLen);
-            offset += packet.dataLen;
-            //打印
-            if (offset - lastsize > slice)
-            {
-                printf("\r%5.2f%%", (float)offset / filesize * 100);
-                fflush(stdout);
-                lastsize = offset;
+    return true;
+}
+
+} // namespace
+
+bool uploadFile(const ClientContext &context, const std::string &localPath)
+{
+    struct stat fileStatus;
+    if (stat(localPath.c_str(), &fileStatus) != 0 || !S_ISREG(fileStatus.st_mode) ||
+        static_cast<std::uint64_t>(fileStatus.st_size) > context.options.maxFileSize) {
+        std::cerr << "invalid or oversized local file\n";
+        return false;
+    }
+    const std::string remoteName = baseName(localPath);
+    if (remoteName.empty() || remoteName == "." || remoteName == "..") {
+        return false;
+    }
+
+    std::string error;
+    const netdisk::ConnectionPtr connection = connectToServer(context, error);
+    if (!connection) {
+        std::cerr << error << std::endl;
+        return false;
+    }
+    const std::string request = "PUT " + context.token + " " +
+                                std::to_string(context.directoryId) + " " + remoteName;
+    if (!netdisk::sendFrame(*connection, request, error)) {
+        std::cerr << error << std::endl;
+        return false;
+    }
+
+    std::string sha256;
+    if (!netdisk::sha256File(localPath, sha256, error) ||
+        !netdisk::sendFrame(*connection, sha256, error)) {
+        std::cerr << error << std::endl;
+        return false;
+    }
+    std::string response;
+    if (!netdisk::receiveText(*connection, response, error)) {
+        std::cerr << error << std::endl;
+        return false;
+    }
+    if (response == "INSTANT") {
+        std::cout << "upload complete (instant)\n";
+        return true;
+    }
+    if (response != "READY") {
+        std::cerr << response << std::endl;
+        return false;
+    }
+
+    if (!netdisk::sendUInt64(*connection,
+                            static_cast<std::uint64_t>(fileStatus.st_size), error)) {
+        std::cerr << error << std::endl;
+        return false;
+    }
+    std::ifstream input(localPath.c_str(), std::ios::binary);
+    std::vector<unsigned char> buffer(netdisk::kFileChunkSize);
+    while (input) {
+        input.read(reinterpret_cast<char *>(buffer.data()), buffer.size());
+        const std::streamsize count = input.gcount();
+        if (count <= 0) {
+            break;
+        }
+        if (!netdisk::sendFrame(*connection, buffer.data(),
+                                static_cast<std::uint32_t>(count), error)) {
+            std::cerr << error << std::endl;
+            return false;
+        }
+    }
+    if (!netdisk::sendFrame(*connection, nullptr, 0, error) ||
+        !netdisk::receiveText(*connection, response, error)) {
+        std::cerr << error << std::endl;
+        return false;
+    }
+    std::cout << response << std::endl;
+    return response == "OK";
+}
+
+bool downloadFile(const ClientContext &context, const std::string &fileName)
+{
+    const std::string temporaryPath = fileName + ".part";
+    struct stat partStatus;
+    std::uint64_t offset = 0;
+    if (stat(temporaryPath.c_str(), &partStatus) == 0 && S_ISREG(partStatus.st_mode)) {
+        offset = static_cast<std::uint64_t>(partStatus.st_size);
+    }
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        std::string error;
+        const netdisk::ConnectionPtr connection = connectToServer(context, error);
+        if (!connection) {
+            std::cerr << error << std::endl;
+            return false;
+        }
+        const std::string request = "GET " + context.token + " " +
+                                    std::to_string(context.directoryId) + " " + fileName +
+                                    " " + std::to_string(offset);
+        if (!netdisk::sendFrame(*connection, request, error)) {
+            std::cerr << error << std::endl;
+            return false;
+        }
+
+        std::string response;
+        if (!netdisk::receiveText(*connection, response, error)) {
+            std::cerr << error << std::endl;
+            return false;
+        }
+        if (response == "NOT_FOUND") {
+            std::cout << "file not found\n";
+            return false;
+        }
+        if (response.compare(0, 6, "FOUND ") != 0) {
+            if (attempt == 0 && response == "ERR invalid offset") {
+                unlink(temporaryPath.c_str());
+                offset = 0;
+                continue;
             }
+            std::cerr << response << std::endl;
+            return false;
         }
-        else
-        {
-            packet.dataLen = filesize - offset;
-            memcpy(packet.buf, pmap + offset, packet.dataLen);
-            sendCycle(sockfd, &packet, sizeof(int) + packet.dataLen);
-            break;
+        const std::string expectedSha256 = response.substr(6);
+        std::uint64_t fileSize = 0;
+        if (!netdisk::receiveUInt64(*connection, fileSize, error) ||
+            fileSize > context.options.maxFileSize || offset > fileSize) {
+            std::cerr << "invalid remote file size or offset\n";
+            return false;
         }
-    }
-    printf("\r100.0000000%%\n");
-    ret = munmap(pmap, filesize);
-    ERROR_CHECK(ret, -1, "munmap");
-    //发送传送结束标志
-    packet.dataLen = 0;
-    sendCycle(sockfd, &packet, sizeof(int));
 
-    close(file_fd);
-    return 0;
-}
-
-/***************************gets*********************************/
-void *downLoad(void *arg)
-{
-    bool flag;
-    LoadTask *task = (LoadTask *)arg;
-    string username = task->username;
-    int Dir = task->Dir;
-    //子线程重新连接开启新的描述符
-    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    if (-1 == sockfd)
-    {
-        perror("sockfd");
-        pthread_exit(NULL);
-    }
-    struct sockaddr_in sockinfo;
-    bzero(&sockinfo, sizeof(sockinfo));
-    sockinfo.sin_addr.s_addr = inet_addr(IP);
-    sockinfo.sin_port = htons(PORT);
-    sockinfo.sin_family = AF_INET;
-    int ret = connect(sockfd, (sockaddr *)&sockinfo, sizeof(sockinfo));
-    if (-1 == ret)
-    {
-        perror("connect");
-        pthread_exit(NULL);
-    }
-
-    //将指令传送到服务器
-    Packet packet;
-    string orders = task->orders;
-    packet.dataLen = strlen(orders.c_str());
-    memcpy(packet.buf, orders.c_str(), packet.dataLen);
-    sendCycle(sockfd, &packet, 4 + packet.dataLen);
-    //解析命令
-    stringstream ss(orders);
-    string order, name, order2; //order代表命令，name代表跟在name后面的文件名，order2代表补充命令（可为空）
-    ss >> order >> name >> order2;
-    const char *FILENAME = name.c_str();
-    off_t offset = stol(order2);
-
-    //发送用户姓名
-    packet.dataLen = strlen(username.c_str());
-    memcpy(packet.buf, username.c_str(), packet.dataLen);
-    sendCycle(sockfd, &packet, 4 + packet.dataLen);
-    //发送目录号
-    sendCycle(sockfd, &Dir, 4);
-
-    //接收服务器的判断，当前目录下有无此文件
-    recvCycle(sockfd, &flag, 1);
-    if (!flag)
-    {
-        cout << "没有该文件!" << endl;
-        pthread_exit(NULL);
-    }
-    //开始接收文件
-    cout << "开始接收文件" << endl;
-    recvFile(sockfd, FILENAME, offset);
-
-    close(sockfd);
-    pthread_exit(NULL);
-}
-
-//断点续传信息包
-struct LoadPacket
-{
-    int fd;
-    off_t loadsize;
-} loadPacket;
-
-void handler(int signum)
-{
-    cout << "终止下载" << endl;
-    ftruncate(loadPacket.fd, loadPacket.loadsize); //断点续传存储点
-    cout << "已下载" << loadPacket.loadsize  << "B" << endl;
-    exit(-1);
-}
-
-int recvFile(int sockfd, const char *FILENAME, off_t offset)
-{
-    bzero(&loadPacket, sizeof(loadPacket));
-    signal(SIGINT, handler);
-    int ret;
-    int dataLen;
-    char buf[1000] = {0};
-
-    //接收文件名称
-    int file_fd = open(FILENAME, O_RDWR | O_CREAT, 0666);
-    ERROR_CHECK(file_fd, -1, "open");
-    loadPacket.fd = file_fd;
-
-    //接收文件大小
-    recvCycle(sockfd, &dataLen, sizeof(int));
-    recvCycle(sockfd, buf, dataLen);
-    off_t filesize;
-    memcpy(&filesize, buf, dataLen);
-    ftruncate(file_fd, filesize);
-
-    //接收文件内容
-    char *pmap = (char *)mmap(NULL, filesize, PROT_WRITE, MAP_SHARED, file_fd, 0);
-    ERROR_CHECK(pmap, (char *)-1, "mmap");
-    off_t download = offset, lastsize = offset;
-    off_t slice = filesize / 100;
-
-    while (1)
-    {
-        recvCycle(sockfd, &dataLen, sizeof(int));
-        if (0 == dataLen)
-        {
-            printf("\r100.00%%\n");
-            break;
+        const int fd = open(temporaryPath.c_str(), O_CREAT | O_WRONLY, 0640);
+        // Keep the partial file length equal to the confirmed prefix. If the
+        // connection breaks, the next run resumes from the real prefix rather
+        // than mistaking a pre-sized sparse file for a completed download.
+        if (fd < 0 || ftruncate(fd, static_cast<off_t>(offset)) != 0 ||
+            lseek(fd, static_cast<off_t>(offset), SEEK_SET) < 0) {
+            if (fd >= 0) {
+                close(fd);
+            }
+            std::cerr << "cannot prepare local partial file\n";
+            return false;
         }
-        else
-        {
-            ret = recvCycle(sockfd, pmap + download, dataLen);
-            if (ret == 0)
-                break; //服务器已经断开
-            if (ret == -1)
-            {
+
+        std::uint64_t received = offset;
+        while (true) {
+            std::vector<unsigned char> chunk;
+            if (!netdisk::receiveFrame(*connection, chunk, error,
+                                       netdisk::kFileChunkSize)) {
+                close(fd);
+                std::cerr << error << std::endl;
+                return false;
+            }
+            if (chunk.empty()) {
                 break;
             }
-            download += dataLen;
-            loadPacket.loadsize = download;
-            if (download - lastsize > slice)
-            {
-                printf("\r%5.2f%%", (float)download / filesize * 100);
-                fflush(stdout);
-                lastsize = download;
+            if (received + chunk.size() > fileSize ||
+                !writeAll(fd, chunk.data(), chunk.size())) {
+                close(fd);
+                std::cerr << "invalid or incomplete download\n";
+                return false;
             }
+            received += chunk.size();
         }
-    }
-    ret = munmap(pmap, filesize);
-    ERROR_CHECK(ret, -1, "munmap");
+        fsync(fd);
+        close(fd);
+        if (received != fileSize) {
+            std::cerr << "download ended before the expected size\n";
+            return false;
+        }
 
-    close(file_fd);
-    return 0;
+        std::string actualSha256;
+        if (!netdisk::sha256File(temporaryPath, actualSha256, error) ||
+            actualSha256 != expectedSha256) {
+            unlink(temporaryPath.c_str());
+            std::cerr << "download checksum verification failed\n";
+            return false;
+        }
+        if (rename(temporaryPath.c_str(), fileName.c_str()) != 0) {
+            std::cerr << "cannot finalize downloaded file\n";
+            return false;
+        }
+        std::cout << "download complete\n";
+        return true;
+    }
+    return false;
 }

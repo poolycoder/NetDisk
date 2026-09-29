@@ -1,311 +1,244 @@
 #include "function.h"
-#include "md5.h"
+
+#include "../common/connection.h"
+#include "../common/protocol.h"
+
+#include <arpa/inet.h>
+#include <cerrno>
+#include <cctype>
+#include <cstring>
+#include <iostream>
+#include <stdexcept>
+#include <sstream>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <vector>
+
+namespace {
+
+bool parseWords(const std::string &command, std::vector<std::string> &words)
+{
+    words.clear();
+    std::istringstream stream(command);
+    std::string word;
+    while (stream >> word) {
+        words.push_back(word);
+    }
+    return !words.empty();
+}
+
+bool validName(const std::string &name)
+{
+    if (name.empty() || name == "." || name == ".." || name.size() > 255) {
+        return false;
+    }
+    for (unsigned char character : name) {
+        if (std::isspace(character) || character == '/' || character == '\\') {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string baseName(const std::string &path)
+{
+    const std::size_t slash = path.find_last_of("/\\");
+    return slash == std::string::npos ? path : path.substr(slash + 1);
+}
+
+bool loadOptions(ClientOptions &options, const std::string &path)
+{
+    netdisk::KeyValueConfig config;
+    std::string error;
+    if (!config.load(path, error)) {
+        std::cerr << error << std::endl;
+        return false;
+    }
+    options.serverIp = config.get("server_ip", options.serverIp);
+    try {
+        const unsigned long port = std::stoul(config.get("server_port", "2000"));
+        if (port > 65535UL) {
+            throw std::runtime_error("port out of range");
+        }
+        options.port = static_cast<std::uint16_t>(port);
+    } catch (...) {
+        std::cerr << "invalid server_port" << std::endl;
+        return false;
+    }
+    options.maxFileSize = config.getUInt64("max_file_size_bytes", options.maxFileSize);
+    return true;
+}
+
+} // namespace
+
+netdisk::ConnectionPtr connectToServer(const ClientContext &context,
+                                       std::string &error)
+{
+    const int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        error = "socket failed: " + std::string(std::strerror(errno));
+        return nullptr;
+    }
+    sockaddr_in address;
+    std::memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_port = htons(context.options.port);
+    if (inet_pton(AF_INET, context.options.serverIp.c_str(), &address.sin_addr) != 1) {
+        error = "invalid server address";
+        close(fd);
+        return nullptr;
+    }
+    if (connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) < 0) {
+        error = "connect failed: " + std::string(std::strerror(errno));
+        close(fd);
+        return nullptr;
+    }
+    const netdisk::ConnectionPtr connection = std::make_shared<netdisk::Connection>(fd);
+    if (!netdisk::connectTls(connection, context.tlsContext, context.options.serverIp,
+                             error)) {
+        return nullptr;
+    }
+    return connection;
+}
 
 int main()
 {
-    int ret;
-    int dataLen = 0;
-    char buf[1000] = {0};
-    Packet packet;
-    bool flag;
-    int Dir = 0;
-    string username;
-    string password;
-    /*****************************连接服务器socket**************************/
-    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-    ERROR_CHECK(sockfd, -1, "socket");
-    struct sockaddr_in sockinfo;
-    bzero(&sockinfo, sizeof(sockinfo));
-    sockinfo.sin_addr.s_addr = inet_addr(IP);
-    sockinfo.sin_port = htons(PORT);
-    sockinfo.sin_family = AF_INET;
-    ret = connect(sockfd, (sockaddr *)&sockinfo, sizeof(sockinfo));
-    ERROR_CHECK(ret, -1, "connect");
-    cout << "connect succuss" << endl;
+    ClientOptions options;
+    if (!loadOptions(options, "../conf/client.conf")) {
+        return 1;
+    }
+    if (!netdisk::initializeTls()) {
+        std::cerr << "OpenSSL initialization failed" << std::endl;
+        return 1;
+    }
+    std::string error;
+    SSL_CTX *tlsContext = netdisk::createClientTlsContext(error);
+    if (tlsContext == nullptr) {
+        std::cerr << error << std::endl;
+        return 1;
+    }
 
-    /******************连接服务器成功，进入界面：选择 注册 OR 登陆**********************/
-console: //当注册或者登陆失败时重新返回这个界面
-    cout << "选择登陆或者注册:" << endl
-         << "1.登陆\t\t\t"
-         << "2.注册\t\t\t"
-         << "3.退出"
-         << endl;
-    string order;
-    int choice;
-    do
-    {
-        cin >> choice;
-        switch (choice)
-        {
-        case 1:
-        {
-            //进行登陆操作
-            cout << "请输入用户名:" << endl;
-            cin >> username;
-            cout << "请输入密码:" << endl;
-            cin >> password;
-            order = "logIn " + username;
-            packet.dataLen = strlen(order.c_str());
-            memcpy(packet.buf, order.c_str(), packet.dataLen);
-            sendCycle(sockfd, &packet, 4 + packet.dataLen);
-            //接收服务器查询结果，有无此用户
-            recvCycle(sockfd, &flag, 1);
-            if (flag == false)
-            {
-                cout << "用户不存在!" << endl
-                     << endl;
-                goto console;
-            }
-            //接收盐值
-            bzero(buf, sizeof(buf));
-            recvCycle(sockfd, &dataLen, 4);
-            recvCycle(sockfd, buf, dataLen);
-            //将接收的盐值使用crypt函数加密后再发送
-            char *cipher = crypt(password.c_str(), buf);
-            packet.dataLen = strlen(cipher);
-            memcpy(packet.buf, cipher, packet.dataLen);
-            sendCycle(sockfd, &packet, 4 + packet.dataLen);
-            //判断最后是否连接成功
-            recvCycle(sockfd, &flag, 1);
-            if (flag == true)
-            {
-                cout << "验证成功！" << endl;
-                goto client_system;
-            }
-            else
-            {
-                cout << "验证失败！账号或密码错误！" << endl;
-                goto console;
-            }
+    ClientContext context;
+    context.options = options;
+    context.tlsContext = tlsContext;
+    netdisk::ConnectionPtr connection = connectToServer(context, error);
+    if (!connection) {
+        std::cerr << error << std::endl;
+        SSL_CTX_free(tlsContext);
+        return 1;
+    }
+    std::cout << "connected to " << options.serverIp << ":" << options.port << std::endl;
+
+    while (context.token.empty()) {
+        std::cout << "1. login  2. register  3. quit\nchoice: ";
+        std::string choice;
+        std::getline(std::cin, choice);
+        if (choice == "3" || !std::cin) {
             break;
         }
-        case 2:
-        {
-            //进行注册操作
-            cout << "请输入用户名:" << endl;
-            cin >> username;
-            cout << "请输入密码:" << endl;
-            cin >> password;
-            order = "signIn " + username + " " + password;
-            packet.dataLen = strlen(order.c_str());
-            memcpy(packet.buf, order.c_str(), packet.dataLen);
-            sendCycle(sockfd, &packet, 4 + packet.dataLen);
-            //判断是否已经有相同的用户
-            recvCycle(sockfd, &flag, 1);
-            if (flag == true)
-            {
-                cout << "注册成功！" << endl
-                     << endl;
-                goto console;
-            }
-            else
-            {
-                cout << "注册失败！用户名已经存在！" << endl
-                     << endl;
-                goto console;
-            }
+        if (choice != "1" && choice != "2") {
+            std::cout << "invalid choice\n";
+            continue;
+        }
+        std::string username;
+        std::string password;
+        std::cout << "username: ";
+        std::getline(std::cin, username);
+        std::cout << "password: ";
+        std::getline(std::cin, password);
+        const std::string operation = (choice == "1" ? "LOGIN " : "REGISTER ") +
+                                      username + " " + password;
+        if (!netdisk::sendFrame(*connection, operation, error)) {
+            std::cerr << error << std::endl;
             break;
         }
-        case 3:
-        {
-            order = "quit ";
-            packet.dataLen = strlen(order.c_str());
-            memcpy(packet.buf, order.c_str(), packet.dataLen);
-            sendCycle(sockfd, &packet, 4 + packet.dataLen);
-            exit(0);
-        }
-        default:
-        {
-            cout << "输入错误！请重新输入！" << endl
-                 << endl;
+        std::string response;
+        if (!netdisk::receiveText(*connection, response, error)) {
+            std::cerr << error << std::endl;
             break;
         }
+        if (choice == "2") {
+            std::cout << response << std::endl;
+            continue;
         }
-    } while (1);
+        if (response.compare(0, 3, "OK ") != 0) {
+            std::cout << response << std::endl;
+            continue;
+        }
+        context.username = username;
+        context.token = response.substr(3);
+        std::cout << "login succeeded\n";
+    }
 
-    /******************************进入客户端系统******************************/
-client_system:
-    while (1)
-    {
-        //读取命令
-        cout << username << "@client:";
-        fflush(stdout);
-        bzero(&packet, sizeof(packet));
-        packet.dataLen = read(STDIN_FILENO, packet.buf, sizeof(packet.buf));
-        ERROR_CHECK(packet.dataLen, -1, "read");
+    while (!context.token.empty() && std::cin) {
+        std::cout << context.username << "@client:";
+        std::string line;
+        std::getline(std::cin, line);
+        std::vector<std::string> words;
+        if (!parseWords(line, words)) {
+            continue;
+        }
+        const std::string command = words[0];
+        if (command == "quit") {
+            netdisk::sendFrame(*connection, "QUIT " + context.token, error);
+            break;
+        }
+        if (command == "puts" && words.size() == 2) {
+            if (!uploadFile(context, words[1])) {
+                std::cout << "upload failed\n";
+            }
+            continue;
+        }
+        if (command == "gets" && words.size() == 2 && validName(words[1])) {
+            if (!downloadFile(context, words[1])) {
+                std::cout << "download failed\n";
+            }
+            continue;
+        }
 
-        //分析标准输入端读取的命令
-        string orders(packet.buf);
-        stringstream ss(orders);
-        string order, name, order2; //order代表命令，name代表跟在name后面的文件名，order2代表补充命令（可为空）
-        ss >> order >> name >> order2;
+        std::string request;
+        if (command == "ls" && words.size() == 1) {
+            request = "LS " + context.token + " " + std::to_string(context.directoryId);
+        } else if (command == "mkdir" && words.size() == 2 && validName(words[1])) {
+            request = "MKDIR " + context.token + " " +
+                      std::to_string(context.directoryId) + " " + words[1];
+        } else if (command == "rmdir" && words.size() == 2 && validName(words[1])) {
+            request = "RMDIR " + context.token + " " +
+                      std::to_string(context.directoryId) + " " + words[1];
+        } else if (command == "rm" && words.size() == 2 && validName(words[1])) {
+            request = "RM " + context.token + " " +
+                      std::to_string(context.directoryId) + " " + words[1];
+        } else if (command == "cd" && words.size() == 2 &&
+                   (words[1] == ".." || validName(words[1]))) {
+            request = "CD " + context.token + " " +
+                      std::to_string(context.directoryId) + " " + words[1];
+        } else {
+            std::cout << "commands: ls, mkdir NAME, rmdir NAME, cd NAME, rm NAME, "
+                         "puts PATH, gets NAME, quit\n";
+            continue;
+        }
 
-        /*******************************ls*****************************/
-        if (order == "ls")
-        {
-            //向服务器发送命令
-            sendCycle(sockfd, &packet, 4 + packet.dataLen);
-            //发送用户姓名
-            packet.dataLen = strlen(username.c_str());
-            memcpy(packet.buf, username.c_str(), packet.dataLen);
-            sendCycle(sockfd, &packet, 4 + packet.dataLen);
-            //发送目录号
-            sendCycle(sockfd, &Dir, 4);
-            //读取服务器返回的信息
-            bzero(buf, sizeof(buf));
-            recvCycle(sockfd, &dataLen, 4);
-            recvCycle(sockfd, buf, dataLen);
-            cout << "-----------所有文件------------" << endl;
-            cout << buf;
-            cout << "-----------所有文件------------" << endl;
+        if (!netdisk::sendFrame(*connection, request, error)) {
+            std::cerr << error << std::endl;
+            break;
         }
-        /*******************************mkdir*****************************/
-        else if (order == "mkdir")
-        {
-            //向服务器发送命令
-            sendCycle(sockfd, &packet, 4 + packet.dataLen);
-            //发送用户姓名
-            packet.dataLen = strlen(username.c_str());
-            memcpy(packet.buf, username.c_str(), packet.dataLen);
-            sendCycle(sockfd, &packet, 4 + packet.dataLen);
-            //发送目录号
-            sendCycle(sockfd, &Dir, 4);
-            //读取服务器返回的信息
-            recvCycle(sockfd, &flag, 1);
-            if (flag)
-            {
-                cout << "创建目录成功!" << endl;
-            }
-            else
-            {
-                cout << "创建失败!有同名目录!" << endl;
-            }
+        std::string response;
+        if (!netdisk::receiveText(*connection, response, error)) {
+            std::cerr << error << std::endl;
+            break;
         }
-        /*******************************rmdir*****************************/
-        else if (order == "rmdir")
-        {
-            //向服务器发送命令
-            sendCycle(sockfd, &packet, 4 + packet.dataLen);
-            //发送用户姓名
-            packet.dataLen = strlen(username.c_str());
-            memcpy(packet.buf, username.c_str(), packet.dataLen);
-            sendCycle(sockfd, &packet, 4 + packet.dataLen);
-            //发送目录号
-            sendCycle(sockfd, &Dir, 4);
-            //读取服务器返回的信息
-            recvCycle(sockfd, &flag, 1);
-            if (flag)
-            {
-                cout << "删除成功!" << endl;
+        if (command == "cd" && response.compare(0, 3, "OK ") == 0) {
+            context.directoryId = std::stoull(response.substr(3));
+            std::cout << "directory changed\n";
+        } else {
+            std::cout << response;
+            if (response.empty() || response.back() != '\n') {
+                std::cout << '\n';
             }
-            else
-            {
-                cout << "删除失败!没有该文件!" << endl;
-            }
-        }
-        /*******************************cd*****************************/
-        else if ("cd" == order)
-        {
-            //先自行分析命令
-            if (Dir == 0 && ".." == name)
-            {
-                cout << "已经到达根目录" << endl;
-            }
-            else if ("." == name)
-            {
-                //do nothing
-            }
-            else
-            {
-                //向服务器发送命令
-                sendCycle(sockfd, &packet, 4 + packet.dataLen);
-                //发送用户姓名
-                packet.dataLen = strlen(username.c_str());
-                memcpy(packet.buf, username.c_str(), packet.dataLen);
-                sendCycle(sockfd, &packet, 4 + packet.dataLen);
-                //发送目录号
-                sendCycle(sockfd, &Dir, 4);
-                //读取服务器返回的信息
-                recvCycle(sockfd, &flag, 1);
-                if (flag)
-                {
-                    recvCycle(sockfd, &Dir, 4);
-                }
-                else
-                {
-                    cout << "没有" << name << "文件!" << endl;
-                }
-            }
-        }
-        /*******************************rm*****************************/
-        else if ("rm" == order)
-        {
-            //向服务器发送命令
-            sendCycle(sockfd, &packet, 4 + packet.dataLen);
-            //发送用户姓名
-            packet.dataLen = strlen(username.c_str());
-            memcpy(packet.buf, username.c_str(), packet.dataLen);
-            sendCycle(sockfd, &packet, 4 + packet.dataLen);
-            //发送目录号
-            sendCycle(sockfd, &Dir, 4);
-            //读取服务器返回的信息
-            recvCycle(sockfd, &flag, 1);
-            if (flag)
-            {
-                cout << "删除成功!" << endl;
-            }
-            else
-            {
-                cout << "删除失败!没有该文件!" << endl;
-            }
-        }
-        /*******************************puts*****************************/
-        else if (order == "puts")
-        {
-            //不像服务器发送命令，而是启动多线程，帮助上传
-            LoadTask task;
-            task.orders = orders;
-            task.username = username;
-            task.Dir = Dir;
-            pthread_t pth1;
-            pthread_create(&pth1, NULL, upLoad, &task);
-            pthread_join(pth1, NULL);
-        }
-        /*******************************gets*****************************/
-        else if (order == "gets")
-        {
-            //不向服务器发送命令，而是启动多线程，帮助下载
-            //断点续传功能
-            struct stat statbuf;
-            ret = stat(name.c_str(), &statbuf);
-            if (-1 == ret)
-            {
-                orders = order + " " + name + " 0";
-            }
-            else
-            {
-                orders = order + " " + name + " " + to_string(statbuf.st_size);
-            }
-            LoadTask task;
-            task.orders = orders;
-            task.username = username;
-            task.Dir = Dir;
-            pthread_t pth2;
-            pthread_create(&pth2, NULL, downLoad, &task);
-            pthread_join(pth2, NULL);
-        }
-        else if (order == "quit")
-        {
-            //向服务器发送命令
-            sendCycle(sockfd, &packet, 4 + packet.dataLen);
-            goto end;
-        }
-        else
-        {
-            cout << "Wrong Command!" << endl;
         }
     }
-end:
-    close(sockfd);
+
+    connection.reset();
+    SSL_CTX_free(tlsContext);
     return 0;
 }
